@@ -36,7 +36,7 @@ with the same properties are the *same ingestion problem* regardless of vendor.
 
 | Property | Question it asks | Why it matters downstream |
 |---|---|---|
-| **Pull vs push** | Who initiates transfer? | Pull: you control pacing, backoff, retries. Push: you must buffer or you drop data — backpressure is your problem |
+| **Pull vs push** | Who initiates transfer? | Pull: you control pacing, backoff, retries. Push: you must buffer or you drop data — **backpressure** is your problem |
 | **Replayability** | Can I re-read last week's data? | Replayable (Kafka log, raw archive) enables Kappa and backfill. Non-replayable (webhooks) forces persist-first architectures |
 | **Incrementality** | Snapshot, change events, or append-only? | Determines merge logic: overwrite, upsert, or append — and idempotency requirements |
 | **Schema contract** | Enforced, versioned, or chaos? | DB schemas are enforced upstream; APIs drift across versions; logs lie. Drives validation and schema-evolution strategy (ch18) |
@@ -48,7 +48,7 @@ with the same properties are the *same ingestion problem* regardless of vendor.
 |---|---|---|---|---|---|
 | File drop | pull | yes (file persists) | snapshot per file | none — chaos | none |
 | REST API | pull | no (state changes) | cursor/watermark | versioned, drifting | rate-limited, theirs |
-| DB query-pull | pull | no | watermark query | enforced | heavy on source |
+| DB query-pull | pull | no. You can rerun a query, but the database usually only contains its current state, not historical versions of rows. Past updates or deletes cannot be recovered reliably. | watermark query | enforced | heavy on source |
 | CDC | pull (log tail) | bounded by log retention | change events | enforced, but changes surprise you | minimal |
 | Kafka topic | push (to consumer) | yes — retention window | append-only stream | registry-enforced | none |
 | Webhook | push | **no** | change events | per-vendor docs | none |
@@ -59,7 +59,7 @@ with the same properties are the *same ingestion problem* regardless of vendor.
 
 Read that table twice. Notice that two columns — **replayability** and
 **incrementality** — decide most of your architecture: replayable + append-only
-(Kafka) is the Kappa-native shape; snapshot-only forces you to build diffing;
+(Kafka) is the Kappa-native shape; snapshot-only forces you to build diffing(comparison between T & T-1);
 non-replayable (webhooks) forces persist-before-process.
 
 ### Patterns compose
