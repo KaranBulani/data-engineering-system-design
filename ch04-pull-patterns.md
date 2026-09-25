@@ -25,8 +25,7 @@ land in object storage and you process them.
   directory of files reads with N tasks. When you control the export, **ask for many files** .
 - **Dealing with partial writes**: a file appearing is not a file being complete.
   Defensive patterns: write-then-rename convention (`tmp/` then `final/`
-  prefixes/partition), or size-stability checks before committing.
-  - These patterns prevent processing a file while it is still being uploaded.
+  prefixes/partition), or size-stability checks before committing. These patterns prevent processing a file while it is still being uploaded.
 
     **Write-then-rename**
 
@@ -80,6 +79,31 @@ the cursor.
 | Offset | `?page=3&limit=100` | breaks under concurrent inserts (skips/dupes); fine for static data |
 | Cursor/token | `?after=eyJpZCI6...` | stable under inserts; the good case |
 | Date-windowed | `?updated_since=...` | natural for sync; overlaps windows to dodge boundary races |
+
+Think of pagination as asking an API to return a large result in smaller
+pages. The three common approaches differ in how the next page is identified:
+
+- **Offset** means "skip the first N rows." For example,
+  `GET /orders?page=3&limit=100` asks for rows 201-300. If a new order is
+  inserted at the beginning after page 1 was read, the row positions shift:
+  page 2 may repeat a row from page 1 or cause another row to be skipped. This
+  is acceptable for a static report, but risky for a live system.
+- **Cursor/token** means "continue after this exact position." The API returns
+  a token with the page, for example,
+  `GET /orders?after=abc123&limit=100`. The client sends that token to get the
+  next page. New rows inserted while reading do not normally shift the already
+  established position, so this is usually the safest option.
+- **Date-windowed** means "return records changed after this time."
+  For example, `GET /orders?updated_since=2026-09-25T10:00:00Z` returns orders
+  updated since 10:00. A sync job might use a five-minute overlap and request
+  from 09:55 on the next run, then remove duplicates by order id. The overlap
+  protects against clock differences and updates arriving exactly at the
+  boundary.
+
+In practice, prefer cursor pagination when the API provides it. Use date
+windows for incremental synchronization when the source exposes a reliable
+`updated_at` field. Treat offset pagination mainly as a choice for static or
+small datasets.
 
 **The watermark pattern and its failure modes** — `WHERE updated_at > last_cursor`
 is the workhorse and the classic trap:
@@ -202,7 +226,7 @@ without the watermark lies.
 
 ## Decision Rules
 
-- **Event notifications over polling listings** — for arrival detection, always.
+- **Event notifications over polling listings** — for arrival detection, always (when checking whether a new file has arrived, prefer a notification from the storage system over repeatedly asking, “Is there a new file yet?”).
 - **Cursor pagination > offset pagination**; overlap date windows and dedup.
 - **Treat `updated_at` watermarks as guilty until proven innocent**: index?
   monotonic? bumped on every update? Any "no" needs a mitigation.
@@ -210,7 +234,11 @@ without the watermark lies.
 - **Parallelize JDBC by a numeric key; size `numPartitions` against the source's
   capacity, not your cluster's.**
 - **Deletes cannot be polled — only diffed or CDC'd.**
-- **Buy commodity connectors; build only strategic ones.**
+- **Buy the plumbing for ordinary sources; invest engineering effort in sources that differentiate or materially affect the business.**
+  - Eg: A company-owned database with unusual requirements.
+  A very high-volume source where per-row connector pricing is expensive.
+  A proprietary system with no reliable existing connector.
+  A source requiring custom transformations or special compliance controls
 - **If a pull is recurring + heavy + from a DB, propose CDC instead.**
 
 ## Failure Modes
