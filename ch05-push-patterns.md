@@ -35,14 +35,14 @@ Read Kafta internals - [Kafka Internals](ch05.1-kafka-pubsub.md)
 
 | Guarantee | Rule | Consequence |
 |---|---|---|
-| Ordering | within a partition only | **need order per entity?** key by entity id. So Order by customer id or order id: use that as the key. Same key -> same partition. Same partition -> events are processed in orde. Different keys -> different partitions -> they can be processed concurrently. That gives you: per-entity ordering, parallelism across entities. **Global order = one partition = no parallelism -- refuse it.** If all events must be strictly ordered globally, then all writes must land in the same partition. That creates a bottleneck: one partition can only be written/read serially, you lose horizontal scaling, throughput collapses to the speed of a single partition/broker path |
+| Ordering | within a partition only | **need order per entity?** key by entity id. So Order by customer id or order id: use that as the key. Same key -> same partition. Same partition -> events are processed in order. Different keys -> different partitions -> they can be processed concurrently. That gives you: per-entity ordering, parallelism across entities. **Global order = one partition = no parallelism -- refuse it.** If all events must be strictly ordered globally, then all writes must land in the same partition. That creates a bottleneck: one partition can only be written/read serially, you lose horizontal scaling, throughput collapses to the speed of a single partition/broker path |
 | Delivery to consumer | at-least-once by default | consumer must be idempotent, or... |
 | Durability | acks=all + min.insync.replicas=2 | message accepted only after in-sync replicas — the no-data-loss setting. **acks** =all tells the Kafka producer: “consider the write successful only when all currently in-sync replicas have stored the record.” **min.insync.replicas=2** tells Kafka: “there must be at least two in-sync replicas available; otherwise reject the write.” |
 | Retention | time/size-based window (default ~7 days) | replay possible *within retention* — this is what makes Kappa possible (ch11) |
 
 **Producer side, briefly:** `acks=0` (fire and forget, loss possible), `acks=1`
 (leader only), `acks=all` (in-sync replicas — the only safe default). Enable
-idempotent producers (`enable.idempotence=true`) to prevent retry-induced
+idempotent producers (`enable.idempotence=true` _Kafka assigns producer sequence numbers so retries of the same send are deduplicated, preventing duplicate records caused by network errors or timeouts._ ) to prevent retry-induced
 duplicates within a session. Kafka's transactional producer + `read_committed`
 consumers give you exactly-once *within the Kafka ecosystem* — processing
 exactly-once end-to-end needs more (ch08).
@@ -261,21 +261,265 @@ decision. The queue is not a detail; it is the load-bearing wall.
 
 ## Failure Modes
 
-- **Global ordering requirement** — "all events in exact order" collapses to one
-  partition, one consumer, no parallelism. Symptom: throughput ceiling exactly at
-  one broker's write rate. Fix the requirement (per-entity order), not the topic.
+- Global ordering requirement
+
+    > “All events must be processed in exact order.”
+
+    Imagine events from many orders:
+
+    ```text
+    Order A: created → paid → shipped
+    Order B: created → paid → shipped
+    ```
+
+    A team may say that every event in the entire system must be processed in one global sequence:
+
+    ```text
+    A-created → B-created → A-paid → B-paid → A-shipped → B-shipped
+    ```
+
+    In Kafka, the normal way to preserve ordering is to put related events in the same partition. But Kafka only guarantees ordering within a partition.
+
+    If you require one global order, you effectively need:
+
+    ```text
+    One topic → One partition → One consumer
+    ```
+
+    That creates a bottleneck. You can no longer process many partitions in parallel.
+
+    The “throughput ceiling” means the entire system can process only as fast as that one broker, partition, and consumer allow.
+
+    Usually, global ordering is unnecessary. What matters is ordering for one entity:
+
+    ```text
+    Order A: created → paid → shipped
+    Order B: created → paid → shipped
+    ```
+
+    Events for the same order are sent to the same partition using `order_id` as the key. Different orders can be processed in parallel.
+
+    The lesson is:
+
+    > Require ordering only where the business needs it, usually per order, account, device, or user.
+
 - **Consumer lag spiral**: processing slower than production, lag grows, retention
   expires oldest, *silent data loss*. Symptom: dashboards fine, reconciliation
-  broken. Alert on lag *and* on retention headroom.
-- **Ack-deadline misses** (Pub/Sub): every message processed twice, exactly-once
-  marketing notwithstanding. Symptom: duplicate side effects downstream.
-- **Webhook handler "doing a little work"**: one slow downstream call inside the
-  handler and Stripe retries fire, your endpoint 500s under load, and the retry
-  storm loses events.
-- **Poison message without a DLT**: one malformed event fails, gets redelivered,
-  fails — the partition is effectively wedged.
-- **Trust in the schema that isn't there**: log field renamed upstream; nulls
-  flow silently into aggregates for weeks.
+  broken. Alert on lag *and* on retention headroom. _`Detailed explanation provided below`_
+- **Ack-deadline misses** (Pub/Sub): 
+    Pub/Sub usually requires a consumer to acknowledge a message within a time limit.
+
+    For example:
+
+    ```text
+    Message delivered
+    → Consumer has 30 seconds to acknowledge it
+    ```
+
+    If processing takes longer than 30 seconds and the consumer does not extend the deadline, Pub/Sub assumes the consumer failed. It sends the message again.
+
+    The original consumer may still finish processing the first copy, so the same event can be processed twice:
+
+    ```text
+    10:00:00  Message delivered
+    10:00:31  Ack deadline expires
+    10:00:31  Message delivered again
+    10:00:35  First processing finishes
+    10:00:40  Second processing finishes
+    ```
+
+    This can create duplicate side effects:
+
+    ```text
+    Charge credit card
+    Send email
+    Create shipment
+    Increment account balance
+    ```
+
+    For example, one order event might accidentally create two shipments.
+
+    The phrase “exactly-once marketing notwithstanding” means that a platform may advertise exactly-once-related features, but those features do not automatically make your entire business operation exactly once. Your database write or external API call may still be repeated.
+
+    The system should:
+
+    - Set the ack deadline based on realistic processing time
+    - Extend the deadline while long processing is underway
+    - Make the consumer idempotent
+    - Deduplicate using an event ID
+    - Use database uniqueness constraints where appropriate
+
+    For example:
+
+    ```sql
+    INSERT INTO processed_events(event_id)
+    VALUES ('evt-123');
+    ```
+
+    If `evt-123` already exists, skip the business operation.
+
+    The lesson is:
+
+    > Assume a message can be delivered more than once, even when the messaging system provides advanced delivery guarantees.
+
+- **Webhook handler "doing a little work"**: 
+    A webhook is an HTTP request from another company, such as Stripe, GitHub, or Shopify.
+
+    A dangerous design looks like this:
+
+    ```text
+    Stripe → Your webhook endpoint
+              ├─ validate request
+              ├─ call database
+              ├─ call shipping service
+              ├─ send email
+              └─ update analytics
+    ```
+
+    The sender expects a fast response. If your endpoint does too much work, it may take several seconds or fail because one downstream service is slow.
+
+    Then the sender assumes delivery failed and retries:
+
+    ```text
+    First request: slow or times out
+    → Stripe retries
+    → second request overlaps
+    → second request also becomes slow
+    → more retries begin
+    ```
+
+    This is a retry storm.
+
+    It can cause:
+
+    - Duplicate orders
+    - Duplicate payments or refunds
+    - Many simultaneous requests
+    - HTTP 500 errors
+    - More load on already-slow dependencies
+    - Lost events if the sender eventually stops retrying
+
+    The safer design is:
+
+    ```text
+    Stripe → Webhook endpoint → Durable queue
+                                  ↓
+                            Background worker
+    ```
+
+    The endpoint should:
+
+    1. Verify the signature.
+    2. Validate the event.
+    3. Persist it durably.
+    4. Return `200 OK` quickly.
+
+    The worker later performs the actual business logic and deduplicates using the webhook event ID.
+
+    The principle is:
+
+    > A webhook endpoint should accept and store the event, not process the whole business workflow synchronously.
+
+- **Poison message without a DLT**: 
+    A poison message is an event that repeatedly fails processing.
+
+    For example:
+
+    ```json
+    {
+      "order_id": "123",
+      "amount": "not-a-number"
+    }
+    ```
+
+    Suppose the consumer expects `amount` to be numeric:
+
+    ```text
+    Read message
+    → parsing fails
+    → message is retried
+    → parsing fails again
+    → message is retried again
+    ```
+
+    If there is no dead-letter topic or queue, the bad message may remain in the normal processing path forever.
+
+    If ordering is involved, later messages may not be processed until the bad one succeeds. That makes the partition appear “wedged”—it is technically running, but progress is stuck.
+
+    The correct pattern is:
+
+    ```text
+    Try message several times
+    → still failing
+    → send to dead-letter topic
+    → continue processing other messages
+    ```
+
+    The dead-letter record should include:
+
+    - Original payload
+    - Error message
+    - Number of attempts
+    - Original topic or queue
+    - Timestamp
+    - Consumer version
+
+    Operators can then inspect and repair the message later.
+
+    The lesson is:
+
+    > Every production event pipeline should have a failure path for permanently invalid messages.
+
+- **Trust in the schema that isn't there**:
+    Suppose your team expects every log event to look like this:
+
+    ```json
+    {
+      "user_id": 42,
+      "event_name": "purchase",
+      "amount": 99.99
+    }
+    ```
+
+    Later, another application changes the field:
+
+    ```json
+    {
+      "user_id": 42,
+      "event": "purchase",
+      "amount": 99.99
+    }
+    ```
+
+    The pipeline may not crash. Instead, it may look for `event_name`, fail to find it, and produce a null value:
+
+    ```text
+    event_name = null
+    ```
+
+    Those nulls may flow into reports and aggregates:
+
+    ```text
+    Purchases by event_name:
+    purchase: 0
+    null: 250,000
+    ```
+
+    If nobody monitors this field, the problem can continue for weeks. The dashboard may still load, so the failure is quiet rather than obvious.
+
+    Good protections include:
+
+    - Validate required fields at ingestion
+    - Track schema versions
+    - Alert when null rates increase
+    - Reject or quarantine invalid records
+    - Keep raw events for investigation
+    - Test producer changes against consumers
+    - Monitor important fields, not just pipeline uptime
+
+    The lesson is:
+
+    > A pipeline can be technically healthy while producing incorrect data. Validate the meaning and shape of the data, not just whether messages are flowing.
 
 ## How to handle Backpressure problem?
 
@@ -326,7 +570,7 @@ If production is faster than processing:
 lag grows → retention window shrinks → old messages expire → data loss
 ```
 
-The page recommends alerting on both:
+Recommendation is to add:
 
 - Consumer lag
 - Remaining retention headroom
@@ -341,7 +585,7 @@ Consumers should safely process duplicates by using:
 - Business keys
 - Idempotent writes
 
-6. **Use dead-letter queues**
+2. **Use dead-letter queues**
 
 If one malformed message repeatedly fails, move it to a dead-letter topic or queue after several attempts. Otherwise, that “poison message” can block progress.
 
