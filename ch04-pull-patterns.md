@@ -22,11 +22,49 @@ land in object storage and you process them.
 - **Arrival detection**: event notifications (S3 -> SNS/SQS, GCS -> Pub/Sub) are
   strictly better than polling listings — lower latency, no listing cost at scale.
 - **Splittability decides parallelism**: one giant CSV reads with one task; a
-  directory of files reads with N tasks. When you control the export, ask for
-  many files.
+  directory of files reads with N tasks. When you control the export, **ask for many files** .
 - **Dealing with partial writes**: a file appearing is not a file being complete.
   Defensive patterns: write-then-rename convention (`tmp/` then `final/`
   prefixes/partition), or size-stability checks before committing.
+  - These patterns prevent processing a file while it is still being uploaded.
+
+    **Write-then-rename**
+
+    1. The producer writes the file to a temporary location, such as `tmp/orders.csv`.
+    2. Once writing finishes, it moves or renames it to `final/orders.csv`.
+    3. Consumers monitor only `final/`, so they process files only after publication.
+
+    For partitioned data, the producer may write an entire partition under a temporary prefix and publish it afterward:
+
+    ```text
+    tmp/date=2026-09-25/part-000.csv
+    tmp/date=2026-09-25/part-001.csv
+    
+    final/date=2026-09-25/part-000.csv
+    final/date=2026-09-25/part-001.csv
+    ```
+
+    The important idea is that temporary paths are invisible to consumers.
+
+    **Caveat:** on local filesystems, rename is usually atomic. In object storage such as S3, a “rename” is commonly implemented as copy-then-delete, so it is not truly atomic. A completion marker such as:
+
+    ```text
+    final/date=2026-09-25/_SUCCESS
+    ```
+
+    can signal that the whole partition is ready.
+
+    **Size-stability checks**
+
+    If the producer cannot use temporary and final locations:
+
+    1. Detect the file.
+    2. Record its size.
+    3. Wait for a period.
+    4. Check the size again.
+    5. Process it only if the size has not changed.
+
+    For example, process `data.csv` only after its size remains `2.4 GB` across two checks. This is weaker than a completion marker because a stalled upload can appear stable, but it is useful when the producer’s behavior cannot be changed.
 - **Semantics**: each file is a snapshot of a moment. History = keeping files.
   Most file feeds have no change events; merges are yours to design.
 
