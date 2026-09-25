@@ -29,14 +29,15 @@ producer chooses partition from KEY hash   consumer group:
  e.g. order-42 -> p1                          instance A reads p0,p1
  (same key -> same partition, forever)        instance B reads p2
 ```
+Read Kafta internals - [Kafka Internals](ch05.1-kafka-pubsub.md)
 
 **The guarantees, precisely:**
 
 | Guarantee | Rule | Consequence |
 |---|---|---|
-| Ordering | within a partition only | need order per entity? key by entity id. Global order = one partition = no parallelism — refuse it |
+| Ordering | within a partition only | **need order per entity?** key by entity id. So Order by customer id or order id: use that as the key. Same key -> same partition. Same partition -> events are processed in orde. Different keys -> different partitions -> they can be processed concurrently. That gives you: per-entity ordering, parallelism across entities. **Global order = one partition = no parallelism -- refuse it.** If all events must be strictly ordered globally, then all writes must land in the same partition. That creates a bottleneck: one partition can only be written/read serially, you lose horizontal scaling, throughput collapses to the speed of a single partition/broker path |
 | Delivery to consumer | at-least-once by default | consumer must be idempotent, or... |
-| Durability | acks=all + min.insync.replicas=2 | message accepted only after in-sync replicas — the no-data-loss setting |
+| Durability | acks=all + min.insync.replicas=2 | message accepted only after in-sync replicas — the no-data-loss setting. **acks** =all tells the Kafka producer: “consider the write successful only when all currently in-sync replicas have stored the record.” **min.insync.replicas=2** tells Kafka: “there must be at least two in-sync replicas available; otherwise reject the write.” |
 | Retention | time/size-based window (default ~7 days) | replay possible *within retention* — this is what makes Kappa possible (ch11) |
 
 **Producer side, briefly:** `acks=0` (fire and forget, loss possible), `acks=1`
@@ -106,19 +107,125 @@ Rules:
 
 ### Logs / clickstream — high volume, low trust
 
-Application logs and product events, shipped by agents (Vector, Fluentd, Filebeat)
-or embedded SDKs (Segment, Snowplow):
+Application logs: `User login failed`. Clickstream events: `User clicked the Buy button`. Product events: `User added an item to the cart`. These events are usually sent automatically by tools such as Vector, Fluentd, Filebeat, Segment, or Snowplow. This data arrives quickly and in huge amounts, but it is not perfectly reliable or consistent.
 
-- **Semi-structured**: JSON-ish, but field presence is aspirational. Validation
-  must happen on your side (schema-on-read at the raw layer, enforced later).
-- **Lossy by convention**: agents buffer, then drop on overflow; mobile SDKs lose
-  events offline. The business *accepts* approximate counts here — a 1% click
-  deficit changes no decision. Say this out loud in interviews; knowing *where*
-  approximate is acceptable is a senior mark.
-- **Out-of-order**: retries, offline flushes, clock skew. Event-time thinking
-  (ch08) is not optional.
-- **Volume is the defining cost**: batch, compress (ch18), and aggregate early;
-  raw clickstream at 50k events/sec is a storage bill, not a dashboard.
+#### 1. Semi-structured data
+
+The events often look like JSON:
+
+```json
+{
+  "user_id": 123,
+  "event": "button_click",
+  "page": "/checkout"
+}
+```
+
+But different applications or versions may send different fields:
+
+```json
+{
+  "event": "button_click"
+}
+```
+
+Or they may use the wrong data type:
+
+```json
+{
+  "user_id": "unknown"
+}
+```
+
+Fields are supposed to be present, but you cannot trust that they always will be.
+
+Therefore, the receiving data system must validate the data. Usually:
+
+1. Store the raw event first, even if it is imperfect.
+2. Inspect and validate it later.
+3. Move valid data into cleaned, structured tables.
+4. Quarantine or fix invalid records.
+
+This is called **schema-on-read** : apply the schema when reading or processing the data, rather than trusting the producer completely.
+
+#### 2. Some data loss is acceptable
+
+Logs and click events are often `lossy` , meaning some events may never arrive.
+
+For example:
+
+- An agent may temporarily store events in memory.
+- If its buffer becomes full, it may drop older events.
+- A mobile phone may be offline and fail to upload events.
+- A retry may fail permanently.
+
+If a website records 99,000 clicks instead of the actual 100,000, the business may still make the same decision. A 1% difference might not matter for a marketing dashboard.
+
+This is different from payments or bank transfers, where losing even one event could be serious.
+
+The important design question is:
+
+> Can the business tolerate approximate results for this type of data?
+
+Recognizing that trade-off is an important data-engineering skill.
+
+#### 3. Events may arrive out of order
+
+Events do not always arrive in the same order in which they happened.
+
+For example:
+
+1. A user clicks “Add to cart.”
+2. The phone goes offline.
+3. The user clicks “Checkout.”
+4. The phone reconnects.
+5. The “Checkout” event arrives first.
+6. The older “Add to cart” event arrives later.
+
+Other causes include retries and incorrect device clocks.
+
+Therefore, systems should usually use the event’s own timestamp—when the action happened—instead of only using the timestamp when the server received it.
+
+This is called event-time processing.
+
+#### 4. The huge volume is the main challenge
+
+Clickstream data can arrive extremely quickly. At 50,000 events per second, the system receives billions of events per day.
+
+That creates large costs for:
+
+- Storage
+- Network transfer
+- Processing
+- Querying
+
+So the system should:
+
+- Batch events together.
+- Compress them before storing or sending them.
+- Aggregate data early where exact raw events are no longer needed.
+
+For example, instead of repeatedly querying billions of individual clicks, the system might create hourly summaries:
+
+```text
+hour        page       click_count
+10:00       /home      1,250,000
+10:00       /pricing   430,000
+```
+
+The phrase “raw clickstream is a storage bill, not a dashboard” means that storing every raw event is expensive, and dashboards usually need summaries rather than every individual click.
+
+### Simple summary
+
+Logs and clickstream data are:
+
+- Fast and high-volume
+- Inconsistent in format
+- Sometimes incomplete
+- Sometimes out of order
+- Usually acceptable to process approximately
+
+A good system stores the raw data safely, validates it later, handles event-time ordering, compresses and batches it, and aggregates it before exposing it to dashboards.
 
 ### Push vs pull — the buffering implication
 
@@ -169,6 +276,84 @@ decision. The queue is not a detail; it is the load-bearing wall.
   fails — the partition is effectively wedged.
 - **Trust in the schema that isn't there**: log field renamed upstream; nulls
   flow silently into aggregates for weeks.
+
+## How to handle Backpressure problem?
+
+> Put a durable buffer—usually a queue or streaming system—between the producer and the consumer.
+
+### The problem
+
+A producer may send data faster than your system can process it:
+
+```text
+Producer: 100,000 events/sec
+Consumer: 60,000 events/sec
+```
+
+The extra 40,000 events per second create **backpressure**. Without a buffer, events are dropped or the producer overwhelms the consumer.
+
+### How the page suggests handling it
+
+1. **Buffer the incoming data**
+
+Use Kafka, Pub/Sub, Kinesis, Event Hubs, or a queue. The queue temporarily absorbs bursts and lets consumers process data at their own speed.
+
+```text
+Producer → Durable queue → Consumer
+```
+
+The queue is described as the “load-bearing wall” of a push architecture.
+
+2. **Size retention for outages**
+
+The queue must retain messages long enough to survive a realistic consumer outage.
+
+For example, if a consumer might be unavailable for two days, configure retention for more than two days. Otherwise, unprocessed messages expire and are silently lost.
+
+3. **Scale consumers**
+
+For Kafka-like systems, divide data into partitions and add consumers to process partitions in parallel. Key records by an entity, such as `order_id`, when ordering matters.
+
+This provides per-order ordering without forcing the entire system through one consumer.
+
+4. **Monitor consumer lag**
+
+Consumer lag shows how far behind the consumer is.
+
+If production is faster than processing:
+
+```text
+lag grows → retention window shrinks → old messages expire → data loss
+```
+
+The page recommends alerting on both:
+
+- Consumer lag
+- Remaining retention headroom
+
+5. **Make consumers idempotent**
+
+Push systems commonly provide at-least-once delivery, so messages may be delivered again during retries or recovery.
+
+Consumers should safely process duplicates by using:
+
+- Event IDs
+- Business keys
+- Idempotent writes
+
+6. **Use dead-letter queues**
+
+If one malformed message repeatedly fails, move it to a dead-letter topic or queue after several attempts. Otherwise, that “poison message” can block progress.
+
+7. **For webhooks: acknowledge quickly**
+
+A webhook handler should:
+
+```text
+Validate → Persist to queue/storage → Return HTTP 200
+```
+
+It should not perform slow business processing inside the request. Processing happens later from the durable queue, preventing vendor retries from creating a retry storm.
 
 ## Interview Narration
 
