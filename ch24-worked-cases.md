@@ -94,9 +94,9 @@ Two ingestion paths, each earning its place. The transaction *events* flow from 
 
 The fraud signal is mostly *velocity*: not any single transaction, but a card's behavior in a time window — "5 transactions in 60 seconds," "3 countries in 10 minutes." That is event-time windowing over a stream (ch08), which means Flink-class processing with state keyed by card: each keyed card carries its recent-transaction state (RocksDB-backed, so it survives restarts and can grow to millions of keys). Events arrive late — network retries guarantee it — so watermarks with allowed lateness, tuned from *observed* lateness rather than a guess, decide when each window closes. And because a redelivered transaction must not double-count a card's velocity, every sink write is idempotent: effectively-once by design.
 
-- **Serving (ch16, ch14)**: features and scores to a KV store (Redis/ DynamoDB) for ms reads by the decision API; the decision itself is a model + rules call. Analysts query the lakehouse/warehouse.
+- **Serving (ch16, ch14)**: streaming maintains online features in a KV store (Redis/DynamoDB) for millisecond reads. The decision API synchronously reads those features, combines them with the in-flight transaction, and runs the model + rules before returning the authorization decision. Analysts query the lakehouse/warehouse.
 
-The decision API has a few milliseconds to fetch features and a score, so they live in a KV store keyed by card (ch14, ch16) — single-digit- millisecond reads, populated continuously by the streaming path. The decision itself is a rules-plus-model call against those features. The *analyst* side has no such constraint: fraud analysts investigating cases query the lakehouse/warehouse, where latency tolerance is minutes and the queries are ad-hoc. Two consumer classes, two serving layers, one architecture — the ch16 lesson applied rather than restated.
+The decision API has a few milliseconds to fetch features, so they live in a KV store keyed by card (ch14, ch16) — single-digit-millisecond reads, populated continuously by the streaming path. The API combines those features with the current transaction and runs the rules-plus-model call synchronously; the authorization response cannot wait for the asynchronous Kafka-to-Flink feature-update path. The *analyst* side has no such constraint: fraud analysts investigating cases query the lakehouse/warehouse, where latency tolerance is minutes and the queries are ad-hoc. Two consumer classes, two serving layers, one architecture — the ch16 lesson applied rather than restated.
 
 - **Quality/ops (ch21)**: feature freshness SLOs; volume anomaly gates (a fraud-model silent failure is catastrophic — monitor the *score distribution*, not just jobs).
 
@@ -105,20 +105,41 @@ The operational danger unique to fraud: the system can fail *silently* in a way 
 ### Architecture sketch
 
 ```
-card txn events --> Kafka --+--> Flink (velocity features, rules)
-                            |        |
-payments DB --CDC (ch06)--> +        +--> KV serving (scores/features) <-- decision API
-                            |                       ^
-                            v                       |
-                     raw plane (S3) --> batch labels/chargebacks --> model training
-                            |                                       |
-                            +--> lakehouse table (ch12) <-----------+   (features + labels)
-                                        |
-                                        v
-                              BI / fraud analytics (ch16)
+SYNCHRONOUS AUTHORIZATION
+         + ------------------ authorization decision ----------------- +
+         |                                                             |
+         v                                                             |
+Payment service -- auth request + current txn --> Decision API (rules + deployed model)
+                                                    ^
+                                                    |
+KV feature store -- latest features --------------- +
+
+ASYNCHRONOUS EVENT / FEATURE PATH
+Payment service -- txn event --> Kafka (transaction topic) --> Flink (velocity features) --> KV feature store
+                                  |                               |
+                                  |                               +--> lakehouse (feature history)
+                                  |
+                                  +-- archive --> raw plane (S3) <-- archive -- Kafka (CDC / chargeback topic) <-- CDC (ch06) -- payments DB
+
+raw plane S3 (transactions + CDC labels) -- batch label joins --> lakehouse (labeled history)
+                                                                   |                     |
+                                                                   v                     v
+                                                         BI / fraud analytics      model training
+                                                              (ch16)                     |
+                                                                                         v
+                                                                                   deployed model --> Decision API
 ```
 
-Reading the sketch: the top path is the streaming decision path (events plus CDC into Flink, features and scores into the KV store, the decision API on the right). The bottom path is the batch truth path (raw plane into label joins and model training), and the lakehouse table in the middle is where the two products meet — features and labels land together for analytics and retraining.
+- Reading the sketch: authorization follows the synchronous path through the decision API, which combines the current transaction with the latest features from KV and runs the model + rules before returning a decision. KV store holds features from prior events. The current transaction is passed directly to the API, because waiting for it to travel through Kafka and Flink would be too slow for an in-flight authorization.
+
+- In parallel, 
+  - transaction events flow through Kafka and Flink to calculate velocity-style features, such as: five transactions from this card in 60 seconds; three countries in ten minutes; unusually high total spend today. 
+    - Flink writes these updated features to the KV store. They will be available for the next transaction’s synchronous decision. 
+    - It also writes feature history to the lakehouse so analysts and model-training jobs have a durable record of how features evolved.
+
+  - later payment-state like chargeback events (via CDC chargeback topic) and transaction events from Kafka's transaction topic are archived to the raw plane; 
+  - batch label joins populate the lakehouse for training (Batch jobs join historic transactions with chargeback/review outcomes. That produces labeled training data: transactions known later to be fraudulent or legitimate) and analyst queries. 
+  - The trained model is deployed to the decision API. The asynchronous feature path does not return the score for the transaction currently awaiting authorization.
 
 ### Failure modes to volunteer
 
@@ -126,7 +147,10 @@ Reading the sketch: the top path is the streaming decision path (events plus CDC
 - Training/serving skew (below, Case 3's disease): the batch-trained model sees features computed differently than the streaming path computes them. The feature-store discipline is the cure.
 - Poison message wedges a partition: DLQ from day one (ch05).
 
-Each with its plain reading. *Lag past retention* is the catastrophic one because it is silent: if the decision path falls behind and events expire from the queue before processing, transactions are simply never scored — no error, no failed job, just fraud that passes unflagged. The mitigation is lag-vs-retention headroom alerting (ch05, ch22), tuned to page long before the queue expires anything. *Training/serving skew* is the model-quality killer: the batch trainer computes "transactions in the last hour" one way, the streaming path computes it slightly differently (a different window boundary, a different dedup rule), and the model's performance live is worse than its performance in training — Case 3 treats this disease in full. *Poison messages* — one malformed event that crashes the processing task every time it is redelivered — wedge a whole keyed partition, so the dead-letter queue exists from day one, not after the first incident (ch05, ch22).
+Each with its plain reading. 
+- *Lag past retention* is the catastrophic one because it is silent: if the decision path falls behind and events expire from the queue before processing, transactions are simply never scored — no error, no failed job, just fraud that passes unflagged. The mitigation is lag-vs-retention headroom alerting (ch05, ch22), tuned to page long before the queue expires anything. 
+- *Training/serving skew* is the model-quality killer: the batch trainer computes "transactions in the last hour" one way, the streaming path computes it slightly differently (a different window boundary, a different dedup rule), and the model's performance live is worse than its performance in training — Case 3 treats this disease in full. 
+- *Poison messages* — one malformed event that crashes the processing task every time it is redelivered — wedge a whole keyed partition, so the dead-letter queue exists from day one, not after the first incident (ch05, ch22).
 
 ### The 60-second close
 
@@ -163,7 +187,7 @@ Three source classes, three ingestion mechanisms. The operational databases (ord
 
 The storage call is lakehouse tables (Iceberg/Delta, ch12) as the core: open formats mean no vendor lock on the canonical data, schema evolution, and time travel for the "what did the dashboard show last Tuesday" question. The letter order matters and is worth saying: *ELT*, not ETL — land raw first, then transform *inside* the platform with SQL (dbt-style, ch21), because transforms written as SQL over the raw plane are versioned, testable, and re-runnable, while transforms applied during loading are where correctness bugs go to hide.
 
-- **Serving (ch16)**: warehouse-direct as default — compute-isolated BI warehouse (connection-string-level workload management), result caching, connection pooling; marts only when scan-cost x frequency x concurrency says no. Semantic layer for "revenue."
+- **Serving (ch16)**: warehouse-direct as default — compute-isolated BI warehouse (connection-string-level workload management), result caching, connection pooling; marts only when warehouse scan-cost x frequency x concurrency says no. Semantic layer for "revenue."
 
 The serving default is *warehouse-direct*: analysts and BI tools query the warehouse's lakehouse tables through its own compute layer, isolated from other workloads, with connection pooling and result caching absorbing the repeat-load (ch16). Precomputed marts are the exception, decided by a little arithmetic — scan cost × refresh frequency × concurrency: a dashboard whose underlying scan is expensive, refreshed hourly, hit by forty users simultaneously justifies a mart; a niche analyst query does not. And the *semantic layer* exists because "revenue" is a theological question — with or without refunds? with or without tax? booked on order date or ship date? — and the answer must be defined *once*, in code, so all forty dashboards cannot quietly disagree with each other.
 
@@ -178,15 +202,25 @@ The follow-up is coming — someone always asks for real-time — and the senior
 ### Architecture sketch
 
 ```
-OLTP DBs --CDC-->  +--------------------------------+
-SaaS (buy, ch04)-> | raw plane (S3, as-landed)      | --lineage/contracts (ch20)
-clickstream ------>|                                |
-                   +------> lakehouse tables (Iceberg/Delta; dbt transforms)
-                                        |
-                                        v
-                     warehouse serving layer (BI_WH compute isolated, ch13/16)
-                                        |
-                     BI (JDBC/ODBC, pooled, SSO) / semantic layer / analysts
+ OLTP DBs ── CDC ─────────┐      completeness gates
+ SaaS apps ── connectors ─┼───── lineage, contracts──> Raw plane: S3 / as-landed
+ Clickstream ─────────────┘                                      │
+                                                                 │ dbt tests, SQL transforms
+                                                                 │ and freshness SLOs
+                                                                 │
+                                                                 v
+                                             Curated lakehouse tables (Iceberg/Delta)
+                                                                 │
+                                                   optional marts for hot dashboards
+                                                                 v
+                                       Warehouse serving compute (isolated BI workload,
+                                                   caching + connection pooling)
+                                                                 │
+                                                                 v
+                                              Semantic layer: governed revenue, orders, Customer Acquisition Cost
+                                                        ┌────────┼─────────┐
+                                                        v        v         v
+                                                   Exec BI   Analysts   Marketing reports
 ```
 
 Reading the sketch: three source classes land in the raw plane as-received (with lineage and contracts registered on the way in, ch20), dbt transforms turn raw into lakehouse tables, and the warehouse serving layer — its own compute, pooled, cached — fronts the BI fleet, the semantic layer, and the analysts.
@@ -197,7 +231,7 @@ Reading the sketch: three source classes land in the raw plane as-received (with
 - Silent half-load (ch07/21): completeness checks before compute.
 - Cost creep: scan-priced dashboards + `SELECT *` — column pruning, partition pruning, marts for the hot few.
 
-The morning queue storm is the predictable one: forty dashboards all configured to refresh at 8am is a self-inflicted thundering herd against the warehouse, and the fixes are pooling, caching, staggered refresh schedules, and the BI fleet on its own isolated compute (ch16) — say "stagger the schedules" and the interviewer hears someone who has been in the room where every dashboard failed at once. The *silent half-load* is the finance-killer: an ingestion that lands half the orders rows with no error, and the revenue dashboard is confidently wrong — completeness checks (row counts against expectation, ch21) run *before* compute, not after the CFO asks. And *cost creep* is the slow one: scan-priced dashboards plus a `SELECT *` somewhere in a hot path, multiplied by forty dashboards and months — the defenses are column and partition pruning (ch17, ch07), and marts for the few genuinely hot scans.
+The morning queue storm is the predictable one: forty dashboards all configured to refresh at 8am is a self-inflicted thundering herd against the warehouse, and the fixes are pooling, caching, staggered refresh schedules (don’t have every dashboard refresh at the same time.), and the BI fleet on its own isolated compute (ch16) — say "stagger the schedules" and the interviewer hears someone who has been in the room where every dashboard failed at once. The *silent half-load* is the finance-killer: an ingestion that lands half the orders rows with no error, and the revenue dashboard is confidently wrong — completeness checks (row counts against expectation, ch21) run *before* computing transformations for dashboards, not after the CFO asks. And *cost creep* is the slow one: scan-priced dashboards plus a `SELECT *` somewhere in a hot path, multiplied by forty dashboards and months — the defenses are column and partition pruning (ch17, ch07), and marts for the few genuinely hot scans.
 
 ### The 60-second close
 
@@ -227,15 +261,15 @@ This is the case where the hybrid answer is forced by inspection, not chosen: so
 
 - **Architecture (ch12)**: the lakehouse is the meeting point — batch features as tables; streaming features upserted by Flink/micro-batch into the same table format for training reads.
 
-The lakehouse is where the two feature worlds meet: batch features are written as lakehouse tables (ch12); streaming features are upserted by Flink or a micro-batch into the same table format. The payoff is training data: a training job reads *one* kind of table — with time travel (ch12) for as-of reads — rather than joining a batch warehouse to a streaming store and hoping they agree.
+The lakehouse is where the two feature worlds meet: batch features are written as lakehouse tables (ch12); streaming (Flink / micro-batch) features are materialized to both the online KV store and offline lakehouse tables. The payoff is training data: a training job reads *one* kind of table — with time travel (ch12) for as-of reads — rather than joining a batch warehouse to a streaming store and hoping they agree.
 
 - **Serving (ch14/16)**: KV store (DynamoDB/Redis) for online features — the *feature store* concept: one definition, two materializations (offline table + online KV), synced by pipeline.
 
 Online inference needs each feature within ~10ms, so the live features sit in a KV store keyed by entity (ch14, ch16). The *feature store* is the governance pattern wrapped around that: every feature has one definition — one transformation codebase — and two *materializations*, the offline lakehouse table for training and the online KV for serving, kept in sync by the pipeline that computes both from the same code. The store is not a product you buy; it is this discipline, whether or not it has a vendor logo.
 
-- **The correctness core — point-in-time correctness**: training rows must carry features *as they existed at event time*, not as they exist now. This means: event-time joins (ch08 semantics), and the offline store must be queryable "as of" (table formats' time travel, ch12, helps). Feature leakage is the silent model killer — volunteer it.
+- **The correctness core — point-in-time correctness**: training rows must carry features *as they existed at event time*, not as they exist now. This means: event-time joins (ch08 semantics), and the offline store must be queryable "as of" (table formats' time travel, ch12, helps). Feature leakage is the silent model killer — volunteer it. F
 
-Made concrete: a training row for "did this user click the recommendation on March 3rd" must carry that user's "clicks in last 10 minutes" *as it was at the moment of the March 3rd request* — not the value recomputed today, which includes everything the user has done since. Joining "current" feature values onto historical events silently feeds the model the future: a churn model trained with "account_closed_date" filled in is memorizing the answer. That is *feature leakage*, and it is silent — the offline metrics look superb and the model is useless in production — which is exactly why it is volunteered unprompted. The mechanics that prevent it: event-time (as-of) joins with ch08 semantics, and an offline store queryable "as of" a timestamp, where table-format time travel (ch12) helps.
+Made concrete: a training row for "did this user click the recommendation on March 3rd" must carry that user's "clicks in last 10 minutes" *as it was at the moment of the March 3rd request* — not the value recomputed today, which includes everything the user has done since. Joining "current" feature values onto historical events silently feeds the model the future: a churn model trained with "account_closed_date" filled in is memorizing the answer. That is *feature leakage* (Feature leakage is when a model’s training data includes information that wouldn’t have been available at the time the model would have made its prediction. That lets the model indirectly see the answer—or future events—so offline test results look unusually good, but real-world performance is poor.), and it is silent — the offline metrics look superb and the model is useless in production — which is exactly why it is volunteered unprompted. The mechanics that prevent it: event-time (as-of) joins with ch08 semantics, and an offline store queryable "as of" a timestamp, where table-format time travel (ch12) helps.
 
 - **Training/serving skew**: the two materializations drift (streaming computes "10-min clicks" slightly differently than the batch backfill does). Mitigations: shared transformation definitions (one codebase — ch09's argument), skew monitoring (compare online/offline feature distributions for the same entity/time).
 
@@ -244,16 +278,64 @@ Even with one intended definition, the two materializations *drift*: the streami
 ### Architecture sketch
 
 ```
-events --> Kafka --+--> Flink: streaming features --upsert--> KV store (online)
-                   |                                    |
-                   v                                    |
-raw plane --> batch: batch features ----+--> lakehouse feature tables (offline)
-                                        |         ^  (point-in-time, time travel)
-                                        +--> training jobs (labels joined as-of)
-skew monitor: compare online vs offline for same entity/time (ch21 thinking)
+                           ┌────────────────── shared feature definitions ───────────────────┐
+                           │   versioned transformations; same windows, joins, dedup rules   │
+                           └─────────────────────────────────────────────────────────────────┘
+
+Events ──> Kafka ──> Raw event plane
+                            │
+             ┌──────────────┼────────────────────┐
+             │              │                    │
+             v              v                    v
+   Flink: recency    Batch: depth features   Label pipeline (click / conversion / outcome events)
+      features              │                    │
+             │              │                    │
+             ├──> Online KV │                    │
+             │              │                    │
+             └──────────────┴────────────────────┘
+                            │
+                            v
+      Lakehouse: offline feature tables + point-in-time label tables
+                            │
+                            v
+         As-of feature/label join → training set → training jobs
+
+Skew monitor: compare online and offline feature values for the same entity and time
+Rebuild: offline feature tables ───────────────────────────────> online KV store
 ```
 
-Reading the sketch: one event plane feeds both feature paths — Flink computes the recency features and upserts the online KV store; batch jobs compute the depth features into the offline lakehouse tables; training jobs join labels as-of event time against those tables; and the skew monitor continuously compares the two materializations for the same entity and time.
+Reading the sketch: one event plane feeds both feature paths — Flink computes the recency features and upserts the online KV store; batch jobs compute the depth features into the offline lakehouse tables; training jobs join labels as-of event time against those tables; and the skew monitor continuously compares the two materializations for the same entity and time. The label pipeline may be a batch job too; I’ve drawn it separately only because labels have a distinct purpose and often arrive later than the original event. The important relationship is: features and labels both become historical lakehouse data; the as-of join produces the training set.
+
+#### Rebuilding Online KV store
+
+Online KV store is a fast, disposable serving copy—not the source of truth. If Redis/DynamoDB is lost, corrupted, or needs a schema/feature-version migration, you rebuild its current values from the durable offline feature tables:
+
+```
+Lakehouse offline features
+        │
+        └── read latest feature value per entity
+                    │
+                    └── bulk upsert
+                            │
+                            v
+                    Online KV feature store
+```
+
+For example, the lakehouse has historical rows such as:
+
+```
+user_id | feature_time        | clicks_10m | purchases_30d
+42      | 2026-10-19 09:00    | 3          | 11
+42      | 2026-10-19 09:01    | 4          | 11
+```
+
+A rebuild selects the latest row for each user and repopulates the KV store:
+
+```
+KV["user:42"] = { clicks_10m: 4, purchases_30d: 11 }
+```
+
+After the bulk restore, Flink resumes applying new events so the online store catches up. This is why the offline/lakehouse representation needs to be complete enough to reconstruct the online projection.
 
 ### Failure modes to volunteer
 
@@ -271,7 +353,7 @@ The three, in the volunteer's voice. *Feature leakage* is the one to name first 
 
 ## Case 4 — IoT Telemetry Platform
 
-**Prompt:** "Design ingestion and analytics for 1M devices emitting telemetry every 10 seconds."
+**Prompt:** "Design ingestion and analytics for 1M devices emitting telemetry every 10 seconds." Telemetry is data automatically collected from devices or software about their activity and condition.
 
 ### Requirements (ch02)
 
@@ -307,20 +389,33 @@ The final step is the reframe that makes this case senior: at a million devices 
 ### Architecture sketch
 
 ```
-1M devices --> edge/gateway (batch, compress) --> Kafka (3-5x burst headroom)
-                                                   |
-                     +-----------------------------+--------------------------+
-                     v                             v                          v
-              Flink: anomaly rules          micro-batch rollups         raw -> S3
-              (1-min SLA, keyed             (hourly aggregates           (30-90d,
-               by device, ch08)              into lakehouse, ch09)        lifecycle)
-                     |                             |                          |
-                     v                             v                          v
-               alerting/KV              BI dashboards (ch16)      archive tier /
-                                                                  downsampling
-```
+1M devices --> edge/gateway (batch, compress, stable event ID)
+                              |
+                              v
+                  Kafka / Pub-Sub (at-least-once; 3-5x burst headroom)
+                              |
+              +---------------+------------------------------+
+              |                                              |
+              v                                              v
+Flink: anomaly rules + dedup window              object-store sink: immutable
+(keyed by device/event ID; 1-min SLA)            raw events --> S3/GCS (30-90d,
+              |                                  duplicates retained; lifecycle)
+              v                                              |
+ alerting + latest-state KV                                  v
+                                              deduplicate / canonicalize
+                                         (idempotent writes by event ID)
+                                                             |
+                                                             v
+                                          canonical telemetry lakehouse tables
+                                                             |
+                                                             v
+                                        micro-batch hourly/daily rollups
+                                                             |
+                                                             v
+                                              BI dashboards / long-term tiers
+``` 
 
-Reading the sketch: devices batch and compress at the edge, then one Kafka topic — provisioned with 3-5x burst headroom — fans out to three consumers by need: Flink for the 1-minute anomaly path only, micro-batch rollups into lakehouse tables for the dashboard path, and raw landing in S3 with lifecycle rules for the archive tier.
+Reading the sketch: devices batch and compress at the edge, then publish at-least-once to Kafka/Pub-Sub, which is provisioned for 3-5x burst headroom. The alert path deduplicates inside its keyed Flink state because duplicate events must not create duplicate alerts. Independently, an object-store sink preserves the immutable, as-received event history — including duplicates — so it can always be replayed. A downstream canonicalization job deduplicates that history with idempotent writes, then produces lakehouse tables and batch rollups for BI. The latest-state KV store is a projection updated from the stream, not a source database that needs CDC.
 
 ### Failure modes to volunteer
 
@@ -370,7 +465,7 @@ Why "defining": each of these is the failure that is *specific to that architect
 
 These cases are for your voice, not your eyes. The final preparation move: pick a prompt, set a 45-minute timer, and narrate the whole cascade out loud - requirements, decisions with trade-offs, failure modes, close - then compare what you said against the case above. The gap between the two is your study list. Repeat until the four-beat decision pattern (options, trade-offs, call, what-would-change-it - ch23) is reflex. The last line of this book is also its first instruction: go practice it out loud.
 
-The method deserves its last paragraph: *out loud*, because the interview is a spoken performance and silent reading rehearses nothing you will actually do; *against a timer*, because the failure mode of the knowledgeable is running out of clock (ch23's unwatched clock); and *compared against the case*, because self-assessed narration always feels complete — the gap between what you said and what the case says is the only honest inventory, and it *is* your study list. When the four-beat pattern survives a 45-minute timer without notes, the cascade has become reflex — and this book has done its job. Go practice it out loud.
+The method deserves its last paragraph: *out loud*, because the interview is a spoken performance and silent reading rehearses nothing you will actually do; *against a timer*, because the failure mode of the knowledgeable is running out of clock (ch23's unwatched clock); and *compared against the case*, because self-assessed narration always feels complete — the gap between what you said and what the case says is the only honest inventory, and it *is* your study list. When the four-beat pattern survives a 45-minute timer without notes, the cascade has become reflex — and this book has done its job. Go practice it out loud.❤️
 
 ---
 
